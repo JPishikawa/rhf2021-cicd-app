@@ -1,0 +1,499 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: argocd-task-sync-and-wait
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/categories: Deployment
+    tekton.dev/tags: deploy
+    tekton.dev/displayName: "argocd"
+    tekton.dev/platforms: "linux/amd64"
+spec:
+  description: >-
+    This task syncs (deploys) an Argo CD application and waits for it to be healthy.
+
+    To do so, it requires the address of the Argo CD server and some form of
+    authentication either a username/password or an authentication token.
+
+  params:
+    - name: application-name
+      description: name of the application to sync
+    - name: revision
+      description: the revision to sync to
+      default: HEAD
+    - name: flags
+      default: --
+    - name: argocd-version
+      default: latest
+  stepTemplate:
+    envFrom:
+      - configMapRef:
+          name: argocd-env-configmap  # used for server address
+      - secretRef:
+          name: argocd-env-secret  # used for authentication (username/password or auth token)
+  steps:
+    - name: login
+      image: docker.io/argoproj/argocd:$(params.argocd-version)
+      script: |
+        if [ -z "$ARGOCD_AUTH_TOKEN" ]; then
+          yes | argocd login "$ARGOCD_SERVER" --username="$ARGOCD_USERNAME" --password="$ARGOCD_PASSWORD" "$(params.flags)";
+        fi
+        argocd app sync "$(params.application-name)" --revision "$(params.revision)" "$(params.flags)"
+        argocd app wait "$(params.application-name)" --health "$(params.flags)"
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: aws-cli
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.17.0"
+    tekton.dev/categories: CLI
+    tekton.dev/tags: cli
+    tekton.dev/displayName: "aws cli"
+    tekton.dev/platforms: "linux/amd64"
+spec:
+  description: >-
+    This task performs operations on Amazon Web Services resources using aws.
+
+  workspaces:
+    - name: source
+      optional: true
+    - name: secrets
+      optional: true
+      mountPath: /root/.aws
+  params:
+    - name: SCRIPT
+      description: The AWS script to run
+      type: string
+      default: "aws $@"
+    - name: ARGS
+      description: AWS cli arguments to be passed
+      type: array
+      default: ["help"]
+  steps:
+    - name: awscli
+      image: docker.io/amazon/aws-cli:2.0.52@sha256:1506cec98a7101c935176d440a14302ea528b8f92fcaf4a6f1ea2d7ecef7edc4 #tag: 2.0.52
+      script: "$(params.SCRIPT)"
+      args:
+        - "$(params.ARGS)"
+---
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-cli
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: git
+    tekton.dev/displayName: "git cli"
+spec:
+  description: >-
+    This task can be used to perform git operations.
+
+    Git command that needs to be run can be passed as a script to
+    the task.This task needs authentication to git in order to push
+    after the git operation.
+
+  workspaces:
+    - name: source
+      description: A workspace that contains the fetched git repository.
+    - name: input
+      description: A workspace that contains file that needs to be added to git.
+  params:
+    - name: BASE_IMAGE
+      description: |
+        The base image for the task.
+      type: string
+      default: docker.io/alpine/git:v2.26.2@sha256:23618034b0be9205d9cc0846eb711b12ba4c9b468efdd8a59aac1d7b1a23363f #tag: v2.26.2
+
+    - name: GIT_USER_NAME
+      type: string
+      description: |
+        Git user name for performing git operation.
+      default: ""
+
+    - name: GIT_USER_EMAIL
+      type: string
+      description: |
+        Git user email for performing git operation.
+      default: ""
+
+    - name: GIT_SCRIPT
+      description: The git script to run.
+      type: string
+      default: |
+        git help
+
+  results:
+    - name: commit
+      description: The precise commit SHA after the git operation.
+
+  steps:
+    - name: git
+      image: $(params.BASE_IMAGE)
+      workingDir: $(workspaces.source.path)
+      script: |
+
+        # Setting up the config for the git.
+        git config --global user.email "$(params.GIT_USER_EMAIL)"
+        git config --global user.name "$(params.GIT_USER_NAME)"
+
+        $(params.GIT_SCRIPT)
+
+        RESULT_SHA="$(git rev-parse HEAD | tr -d '\n')"
+        EXIT_CODE="$?"
+        if [ "$EXIT_CODE" != 0 ]
+        then
+          exit $EXIT_CODE
+        fi
+        # Make sure we don't add a trailing newline to the result!
+        echo -n "$RESULT_SHA" > $(results.commit.path)
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-clone
+  labels:
+    app.kubernetes.io/version: "0.3"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.21.0"
+    tekton.dev/tags: git
+    tekton.dev/displayName: "git clone"
+spec:
+  description: >-
+    These Tasks are Git tasks to work with repositories used by other tasks
+    in your Pipeline.
+
+    The git-clone Task will clone a repo from the provided url into the
+    output Workspace. By default the repo will be cloned into the root of
+    your Workspace. You can clone into a subdirectory by setting this Task's
+    subdirectory param. This Task also supports sparse checkouts. To perform
+    a sparse checkout, pass a list of comma separated directory patterns to
+    this Task's sparseCheckoutDirectories param.
+
+  workspaces:
+    - name: output
+      description: The git repo will be cloned onto the volume backing this workspace
+  params:
+    - name: url
+      description: git url to clone
+      type: string
+    - name: revision
+      description: git revision to checkout (branch, tag, sha, ref…)
+      type: string
+      default: ""
+    - name: refspec
+      description: (optional) git refspec to fetch before checking out revision
+      default: ""
+    - name: submodules
+      description: defines if the resource should initialize and fetch the submodules
+      type: string
+      default: "true"
+    - name: depth
+      description: performs a shallow clone where only the most recent commit(s) will be fetched
+      type: string
+      default: "1"
+    - name: sslVerify
+      description: defines if http.sslVerify should be set to true or false in the global git config
+      type: string
+      default: "true"
+    - name: subdirectory
+      description: subdirectory inside the "output" workspace to clone the git repo into
+      type: string
+      default: ""
+    - name: sparseCheckoutDirectories
+      description: defines which directories patterns to match or exclude when performing a sparse checkout
+      type: string
+      default: ""
+    - name: deleteExisting
+      description: clean out the contents of the repo's destination directory (if it already exists) before trying to clone the repo there
+      type: string
+      default: "true"
+    - name: httpProxy
+      description: git HTTP proxy server for non-SSL requests
+      type: string
+      default: ""
+    - name: httpsProxy
+      description: git HTTPS proxy server for SSL requests
+      type: string
+      default: ""
+    - name: noProxy
+      description: git no proxy - opt out of proxying HTTP/HTTPS requests
+      type: string
+      default: ""
+    - name: verbose
+      description: log the commands used during execution
+      type: string
+      default: "true"
+    - name: gitInitImage
+      description: the image used where the git-init binary is
+      type: string
+      default: "gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.21.0"
+  results:
+    - name: commit
+      description: The precise commit SHA that was fetched by this Task
+    - name: url
+      description: The precise URL that was fetched by this Task
+  steps:
+    - name: clone
+      image: $(params.gitInitImage)
+      script: |
+        #!/bin/sh
+        set -eu -o pipefail
+
+        if [[ "$(params.verbose)" == "true" ]] ; then
+          set -x
+        fi
+
+        CHECKOUT_DIR="$(workspaces.output.path)/$(params.subdirectory)"
+
+        cleandir() {
+          # Delete any existing contents of the repo directory if it exists.
+          #
+          # We don't just "rm -rf $CHECKOUT_DIR" because $CHECKOUT_DIR might be "/"
+          # or the root of a mounted volume.
+          if [[ -d "$CHECKOUT_DIR" ]] ; then
+            # Delete non-hidden files and directories
+            rm -rf "$CHECKOUT_DIR"/*
+            # Delete files and directories starting with . but excluding ..
+            rm -rf "$CHECKOUT_DIR"/.[!.]*
+            # Delete files and directories starting with .. plus any other character
+            rm -rf "$CHECKOUT_DIR"/..?*
+          fi
+        }
+
+        if [[ "$(params.deleteExisting)" == "true" ]] ; then
+          cleandir
+        fi
+
+        test -z "$(params.httpProxy)" || export HTTP_PROXY=$(params.httpProxy)
+        test -z "$(params.httpsProxy)" || export HTTPS_PROXY=$(params.httpsProxy)
+        test -z "$(params.noProxy)" || export NO_PROXY=$(params.noProxy)
+
+        /ko-app/git-init \
+          -url "$(params.url)" \
+          -revision "$(params.revision)" \
+          -refspec "$(params.refspec)" \
+          -path "$CHECKOUT_DIR" \
+          -sslVerify="$(params.sslVerify)" \
+          -submodules="$(params.submodules)" \
+          -depth "$(params.depth)" \
+          -sparseCheckoutDirectories "$(params.sparseCheckoutDirectories)"
+        cd "$CHECKOUT_DIR"
+        RESULT_SHA="$(git rev-parse HEAD)"
+        EXIT_CODE="$?"
+        if [ "$EXIT_CODE" != 0 ] ; then
+          exit $EXIT_CODE
+        fi
+        # ensure we don't add a trailing newline to the result
+        echo -n "$RESULT_SHA" > $(results.commit.path)
+        echo -n "$(params.url)" > $(results.url.path)
+
+---
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: kustomize
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.17.0"
+    tekton.dev/tags: kubernetes
+spec:
+  description: >-
+    This Task use kustomize to simplifies the use of off-the-shelf applications.
+  workspaces:
+    - name: manifest-dir
+      optional: true
+  params:
+    - name: KUSTOMIZE_SCRIPT
+      description: The Kustomize CLI script to run
+      type: string
+      default: "kustomize $@"
+    - name: KUSTOMIZE_IMAGE
+      default: k8s.gcr.io/kustomize/kustomize:v4.0.2
+      description: kustomize wrapper image
+  steps:
+    - name: kustomize
+      image: $(params.KUSTOMIZE_IMAGE)
+      script: |
+        [[ "$(workspaces.manifest-dir.bound)" == "true" ]] && \
+        cd $(workspaces.manifest-dir.path) 
+
+        $(params.KUSTOMIZE_SCRIPT)
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: sonarqube-scanner
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: security
+    tekton.dev/displayName: "sonarqube scanner"
+spec:
+  description: >-
+    The following task can be used to perform static analysis on the source code
+    provided the SonarQube server is hosted
+    SonarQube is the leading tool for continuously inspecting the Code Quality and Security
+    of your codebases, all while empowering development teams. Analyze over 25 popular
+    programming languages including C#, VB.Net, JavaScript, TypeScript and C++. It detects
+    bugs, vulnerabilities and code smells across project branches and pull requests.
+  workspaces:
+    - name: source-dir
+    - name: sonar-settings
+  params:
+    - name: SONAR_HOST_URL
+      description: Host URL where the sonarqube server is running
+      default: ""
+    - name: SONAR_PROJECT_KEY
+      description: Project's unique key
+      default: ""
+  steps:
+    - name: sonar-properties-create
+      image: registry.access.redhat.com/ubi8/ubi-minimal:8.2
+      workingDir: $(workspaces.source-dir.path)
+      script: |
+        #!/usr/bin/env bash
+        replaceValues() {
+          filename=$1
+          thekey=$2
+          newvalue=$3
+          if ! grep -R "^[#]*\s*${thekey}=.*" $filename >/dev/null; then
+            echo "APPENDING because '${thekey}' not found"
+            echo "" >>$filename
+            echo "$thekey=$newvalue" >>$filename
+          else
+            echo "SETTING because '${thekey}' found already"
+            sed -ir "s|^[#]*\s*${thekey}=.*|$thekey=$newvalue|" $filename
+          fi
+        }
+        if [[ -f $(workspaces.sonar-settings.path)/sonar-project.properties ]]; then
+          echo "using user provided sonar-project.properties file"
+          cp -R $(workspaces.sonar-settings.path)/sonar-project.properties $(workspaces.source-dir.path)/sonar-project.properties
+        fi
+        if [[ -f $(workspaces.source-dir.path)/sonar-project.properties ]]; then
+          if [[ -n "$(params.SONAR_HOST_URL)" ]]; then
+            replaceValues $(workspaces.source-dir.path)/sonar-project.properties sonar.host.url $(params.SONAR_HOST_URL)
+          fi
+          if [[ -n "$(params.SONAR_PROJECT_KEY)" ]]; then
+            replaceValues $(workspaces.source-dir.path)/sonar-project.properties sonar.projectKey $(params.SONAR_PROJECT_KEY)
+          fi
+        else
+          touch sonar-project.properties
+          echo "sonar.projectKey=$(params.SONAR_PROJECT_KEY)" >> sonar-project.properties
+          echo "sonar.host.url=$(params.SONAR_HOST_URL)" >> sonar-project.properties
+          echo "sonar.sources=." >> sonar-project.properties
+        fi
+        echo "---------------------------"
+        cat $(workspaces.source-dir.path)/sonar-project.properties
+    - name: sonar-scan
+      image: docker.io/sonarsource/sonar-scanner-cli:4.6@sha256:edbf641d656ef38548eaf652b857afde7ce6235f6b458a523ba1670a728da6ad
+      workingDir: $(workspaces.source-dir.path)
+      command:
+        - sonar-scanner
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: testcafe
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.21.0"
+    tekton.dev/categories: Testing
+    tekton.dev/tags: test
+spec:
+  description: >-
+    The following task can be used to perform E2E tests for deployed applications by TestCafe.
+    TestCafe offers simplyfied E2E tests for multi browsers and allows users to write readable test codes in javascript or typescript. 
+  params:
+  - name: TESTCAFE_SCRIPT
+    description: The testcafe CLI command to run
+    type: string
+    default: "testcafe $@"
+  - name: TESTCAFE_IMAGE
+    description: The location of the testcafe image.
+    default: testcafe/testcafe:latest
+  - name: TARGET_URL
+    description: Target URL for E2E tests.
+    default: ""
+  workspaces:
+  - name: tests
+  stepTemplate:
+    env:
+    - name: TARGET_URL
+      value: $(params.TARGET_URL)
+  steps:
+  - name: e2e-tests
+    image: $(params.TESTCAFE_IMAGE)
+    script: |
+      [[ "$(workspaces.tests.bound)" == "true" ]] && \
+        cd $(workspaces.tests.path) 
+
+        $(params.TESTCAFE_SCRIPT)
+---
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: trivy
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.21.0"
+    tekton.dev/categories: Security
+    tekton.dev/tags: Security
+spec:
+  description: >-
+    This Task scans Comprehensive Vulnerability using Trivy for Containers
+    and other Artifacts, Suitable in CI.
+  params:
+  - name: IMAGE
+    description: Reference of the image Trivy will scan.
+  - name: IMAGE_DIGEST
+    description: Reference of the image digest Trivy will scan.
+  - name: TRIVY_IMAGE
+    description: The location of the Trivy scan image.
+    default: aquasec/trivy:0.19.2
+  - name: TRIVY_USERNAME
+    description: Authentication user name to get the target scan image.
+    default: ""
+  - name: TRIVY_PASSWORD
+    description: Authentication password to get the target scan image.
+    default: ""
+  workspaces:
+  - name: cache
+  stepTemplate:
+    env:
+    - name: TRIVY_USERNAME
+      value: $(params.TRIVY_USERNAME)
+    - name: TRIVY_PASSWORD
+      value: $(params.TRIVY_PASSWORD)
+  steps:
+  - name: build-report
+    image: $(params.TRIVY_IMAGE)
+    script: |
+      SCAN_CONTAINER_IMAGE=$(params.IMAGE)@$(params.IMAGE_DIGEST)
+      trivy --cache-dir=$(workspaces.cache.path)/trivy \
+        image --timeout 10m --exit-code=0 --severity=HIGH,CRITICAL \
+        ${SCAN_CONTAINER_IMAGE}
+#  - name: severe-vulnerabilities
+#    image: $(params.TRIVY_IMAGE)
+#    script: |
+#      SCAN_CONTAINER_IMAGE=$(params.IMAGE)@$(params.IMAGE_DIGEST)
+#      trivy --cache-dir=$(workspaces.cache.path)/trivy \
+#        image --exit-code=1 --no-progress --severity=CRITICAL \
+#        ${SCAN_CONTAINER_IMAGE}
+
+---
